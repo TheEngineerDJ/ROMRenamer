@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Compose supplies the real colour scheme; this theme only needs to be an
+        action-bar-less starting point with a transparent system bar setup so
+        enableEdgeToEdge() can take over.
+    -->
+    <style name="Theme.ROMRenamer" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">@android:color/white</item>
+    </style>
+</resources>
