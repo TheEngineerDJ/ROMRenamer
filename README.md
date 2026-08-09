@@ -4,8 +4,10 @@ An Android app that renames a folder of ROM files to the official No-Intro / Red
 standard. It hashes every file, looks the hash up in a DAT you supply, shows you exactly
 what it intends to do, and only renames once you confirm.
 
-Matching is by content, not by file name — a file called `smw.smc` is recognised as
-`Super Mario World (USA).sfc` because its CRC32 says so.
+Matching is by content first — a file called `smw.smc` is recognised as
+`Super Mario World (USA).sfc` because its CRC32 says so. Files whose bytes have been
+altered, which no hash can identify, fall back to matching on their name, clearly marked
+as the guess it is.
 
 ## How it works
 
@@ -18,9 +20,13 @@ Matching is by content, not by file name — a file called `smw.smc` is recognis
    and skipped, never fatal.
 3. **Scan.** Every file is read once and hashed off the main thread. Files whose size
    appears in no DAT entry are skipped without being read at all.
-4. **Review.** A list shows current name, official name, and match status for each file.
+4. **Fall back to the name.** Scrubbed, trimmed, and re-encoded scene rips fail every hash
+   check by design — the bytes really are different. When nothing in the database fits a
+   file's bytes, its name is cleaned up and compared against the official titles. These are
+   flagged as **Text matched**, never mixed in with verified results, and start unticked.
+5. **Review.** A list shows current name, official name, and match status for each file.
    Nothing on disk has changed yet.
-5. **Rename.** Ticked rows are renamed in place with `DocumentFile.renameTo`. Files are
+6. **Rename.** Ticked rows are renamed in place with `DocumentFile.renameTo`. Files are
    never moved, copied, or deleted.
 
 ## Project layout
@@ -35,6 +41,9 @@ app/src/main/java/com/romrenamer/app/
 │   │                DatLoader       — merges a whole selection into one index
 │   ├── hash/        HashEngine      — CRC32 / MD5 / SHA-1 on coroutines, zip-aware
 │   ├── match/       RomMatcher      — hash lookup and collision resolution
+│   │                FuzzyTitleMatcher — indexed name matching for scrubbed rips
+│   ├── text/        TitleNormalizer — folds names and titles to a comparable form
+│   │                StringSimilarity  — Levenshtein and Jaccard measures
 │   ├── rename/      BatchRenamer    — collision-checked, ordered rename execution
 │   │                RomNaming       — official name derivation and sanitisation
 │   └── scan/        RomScanner      — orchestrates walk → hash → match, streams results
@@ -67,6 +76,30 @@ show exactly which files contributed and which were passed over — a silently i
 would otherwise look identical to a ROM that genuinely is not catalogued. `DatParser`
 stages a file's games and commits them only on a clean parse, so a file that fails halfway
 contributes nothing.
+
+**Why text matching is a fallback and not a feature.** A scrubbed or re-encoded rip has
+different bytes from the catalogued dump, so no hash will ever identify it — but its name
+usually still does. `FuzzyTitleMatcher` runs only after the hash path has come up empty,
+and what it produces is a guess: it is a distinct `MatchStatus`, shown in amber as
+"Text matched", counted separately, left unticked, and called out again in the confirmation
+dialog. Nothing about it is allowed to look like a verified match.
+
+Two measures are combined, because they fail in different places: Levenshtein catches typos
+and punctuation drift but punishes reordering, while Jaccard over token sets ignores word
+order entirely but cannot see inside a word. The better of the two carries the match.
+
+Numeric tokens are the exception and must agree exactly. Edit distance rates
+"Gran Turismo 5" as 93% similar to "Gran Turismo 4" — one cheap character — when to a
+player they are different games. Version stamps like `v1.2` are stripped before this
+check so they are not mistaken for sequel numbers.
+
+Region tags are stripped from both sides, so a bare `Metal Gear Solid.bin` fits both the
+USA and Europe releases. That is reported as ambiguous rather than resolved by picking one:
+a coin flip here silently mislabels the file.
+
+Scoring every file against every title would be hopeless once several DATs are merged, so
+an inverted token index narrows each file to the titles sharing a word with it, rarest word
+first. The index is built on first use, so a library that hashes cleanly never pays for it.
 
 **Why the size filter.** Two files can only share a hash if they share a length, so a size
 that appears in no DAT entry is a guaranteed miss. Skipping those files avoids reading
@@ -101,7 +134,8 @@ Requires JDK 17+ and the Android SDK (compileSdk 35, minSdk 26).
 ```
 
 The JVM unit tests cover the DAT parser, the hash index, multi-DAT merging, the matcher's
-collision handling, name sanitisation, and the file filter. They use kxml2 to supply the
+collision handling, filename normalisation, the similarity measures and the fuzzy fallback's
+refusals, name sanitisation, and the file filter. They use kxml2 to supply the
 same `XmlPullParser` implementation Android provides on device.
 
 ## Limitations
@@ -112,4 +146,8 @@ same `XmlPullParser` implementation Android provides on device.
   entries and will not match. Header-skipping is not implemented.
 - The merged database is capped at `DatLoader.DEFAULT_MAX_ROM_ENTRIES`. A complete No-Intro
   collection exceeds it; the app loads what fits and tells you it stopped early.
+- Text matching needs a name that still contains the title. Heavy abbreviations such as
+  `su-dbz.iso` are deliberately refused rather than guessed at.
+- A text match is only ever as good as the file name. Check the flagged rows before
+  renaming them; nothing about the file's contents has been verified.
 - Renames cannot be undone from inside the app.

@@ -10,6 +10,7 @@ import com.romrenamer.app.core.dat.DatIndex
 import com.romrenamer.app.core.dat.DatLoadResult
 import com.romrenamer.app.core.dat.DatLoader
 import com.romrenamer.app.core.dat.DatSource
+import com.romrenamer.app.core.match.FuzzyTitleMatcher
 import com.romrenamer.app.core.match.MatchStatus
 import com.romrenamer.app.core.match.ScanSummary
 import com.romrenamer.app.core.match.ScannedRom
@@ -252,6 +253,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val options = ScanOptions(
             namingPolicy = _state.value.namingPolicy,
             inspectArchives = _state.value.inspectArchives,
+            fuzzyMatching = _state.value.fuzzyMatching,
+            fuzzyThreshold = _state.value.fuzzyThreshold,
         )
 
         scanJob = viewModelScope.launch {
@@ -374,20 +377,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(namingPolicy = policy) }
         prefs.edit().putString(KEY_NAMING_POLICY, policy.name).apply()
         // Target names are derived from the policy, so previous results are now stale.
-        if (workingRoms.isNotEmpty()) {
-            clearResults()
-            _state.update { it.copy(message = "Naming changed — run the scan again.") }
-        }
+        invalidateResults("Naming changed — run the scan again.")
     }
 
     fun setInspectArchives(enabled: Boolean) {
         if (enabled == _state.value.inspectArchives) return
         _state.update { it.copy(inspectArchives = enabled) }
         prefs.edit().putBoolean(KEY_INSPECT_ARCHIVES, enabled).apply()
-        if (workingRoms.isNotEmpty()) {
-            clearResults()
-            _state.update { it.copy(message = "Archive handling changed — run the scan again.") }
-        }
+        invalidateResults("Archive handling changed — run the scan again.")
+    }
+
+    fun setFuzzyMatching(enabled: Boolean) {
+        if (enabled == _state.value.fuzzyMatching) return
+        _state.update { it.copy(fuzzyMatching = enabled) }
+        prefs.edit().putBoolean(KEY_FUZZY_MATCHING, enabled).apply()
+        invalidateResults("Text matching changed — run the scan again.")
+    }
+
+    fun setFuzzyThreshold(threshold: Float) {
+        if (threshold == _state.value.fuzzyThreshold) return
+        _state.update { it.copy(fuzzyThreshold = threshold) }
+        prefs.edit().putFloat(KEY_FUZZY_THRESHOLD, threshold).apply()
+        invalidateResults("Match confidence changed — run the scan again.")
+    }
+
+    /** Drops stale rows after a setting that would change what a scan produces. */
+    private fun invalidateResults(reason: String) {
+        if (workingRoms.isEmpty()) return
+        clearResults()
+        _state.update { it.copy(message = reason) }
     }
 
     // ---------------------------------------------------------------- renaming
@@ -516,7 +534,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         prefs.getString(KEY_NAMING_POLICY, null)
             ?.let { name -> NamingPolicy.entries.firstOrNull { it.name == name } }
             ?.let { policy -> _state.update { it.copy(namingPolicy = policy) } }
-        _state.update { it.copy(inspectArchives = prefs.getBoolean(KEY_INSPECT_ARCHIVES, true)) }
+        _state.update {
+            it.copy(
+                inspectArchives = prefs.getBoolean(KEY_INSPECT_ARCHIVES, true),
+                fuzzyMatching = prefs.getBoolean(KEY_FUZZY_MATCHING, true),
+                fuzzyThreshold = prefs.getFloat(
+                    KEY_FUZZY_THRESHOLD,
+                    FuzzyTitleMatcher.DEFAULT_THRESHOLD,
+                ),
+            )
+        }
 
         prefs.getString(KEY_TREE_URI, null)?.let { saved ->
             val uri = Uri.parse(saved)
@@ -573,6 +600,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         const val KEY_DAT_FILE_URIS = "dat_file_uris"
         const val KEY_NAMING_POLICY = "naming_policy"
         const val KEY_INSPECT_ARCHIVES = "inspect_archives"
+        const val KEY_FUZZY_MATCHING = "fuzzy_matching"
+        const val KEY_FUZZY_THRESHOLD = "fuzzy_threshold"
         const val EMIT_INTERVAL_MS = 120L
     }
 }

@@ -1,11 +1,15 @@
 package com.romrenamer.app.core.scan
 
 import android.net.Uri
+import com.romrenamer.app.core.dat.DatEntry
 import com.romrenamer.app.core.dat.DatIndex
+import com.romrenamer.app.core.hash.FileHashes
 import com.romrenamer.app.core.hash.HashAlgorithm
 import com.romrenamer.app.core.hash.HashEngine
 import com.romrenamer.app.core.hash.HashOutcome
 import com.romrenamer.app.core.hash.HashingException
+import com.romrenamer.app.core.match.FuzzyResult
+import com.romrenamer.app.core.match.FuzzyTitleMatcher
 import com.romrenamer.app.core.match.MatchResult
 import com.romrenamer.app.core.match.MatchStatus
 import com.romrenamer.app.core.match.RomMatcher
@@ -40,6 +44,17 @@ data class ScanOptions(
      * and removes the second read that ambiguous CRC hits would otherwise need.
      */
     val alwaysComputeStrongHashes: Boolean = false,
+    /**
+     * Fall back to matching the file name against DAT titles when the bytes match nothing.
+     *
+     * Scrubbed and re-encoded rips fail every hash check by design, so without this they
+     * are simply unmatched. The result is a guess and is reported as one.
+     */
+    val fuzzyMatching: Boolean = true,
+
+    /** Similarity a file name must reach to be accepted as a text match. */
+    val fuzzyThreshold: Float = FuzzyTitleMatcher.DEFAULT_THRESHOLD,
+
     /**
      * Files hashed at once. Flash storage rewards a little parallelism, but too much just
      * thrashes the provider and starves the UI.
@@ -83,6 +98,9 @@ class RomScanner(
     fun scan(treeUri: Uri, index: DatIndex, options: ScanOptions = ScanOptions()): Flow<ScanEvent> =
         channelFlow {
             val matcher = RomMatcher(index)
+            // Built on first use and shared by every worker. A library that hashes cleanly
+            // never touches it, and never pays to tokenise the whole database.
+            val fuzzy = lazy { FuzzyTitleMatcher.build(index, options.fuzzyThreshold) }
 
             val files = try {
                 send(ScanEvent.Listing(0, ""))
@@ -112,7 +130,7 @@ class RomScanner(
                 files.forEach { file ->
                     launch {
                         permits.withPermit {
-                            val rom = process(file, index, matcher, options) { bytes ->
+                            val rom = process(file, index, matcher, fuzzy, options) { bytes ->
                                 trySend(ScanEvent.FileProgress(file.uri.toString(), bytes, file.size))
                             }
                             send(
@@ -134,6 +152,7 @@ class RomScanner(
         file: RomFile,
         index: DatIndex,
         matcher: RomMatcher,
+        fuzzy: Lazy<FuzzyTitleMatcher>,
         options: ScanOptions,
         onBytes: (Long) -> Unit,
     ): ScannedRom {
@@ -141,7 +160,10 @@ class RomScanner(
         // size shortcut cannot be applied to it.
         val isArchive = options.inspectArchives && file.extension == "zip"
         if (options.useSizeFilter && !isArchive && !index.hasSize(file.size)) {
-            return ScannedRom(file = file, status = MatchStatus.SizeExcluded, selected = false)
+            // No DAT entry is this long, so hashing is pointless — but a scrubbed rip is
+            // exactly the file that would land here, so its name still deserves a look.
+            return fuzzyFallback(file, fuzzy, options, sizeMismatch = true)
+                ?: ScannedRom(file = file, status = MatchStatus.SizeExcluded, selected = false)
         }
 
         val algorithms = buildSet {
@@ -179,7 +201,78 @@ class RomScanner(
             result = matcher.match(outcome.hashes)
         }
 
+        if (result is MatchResult.NotFound) {
+            fuzzyFallback(file, fuzzy, options, sizeMismatch = false, hashes = outcome.hashes)
+                ?.let { return it }
+        }
+
         return toScannedRom(file, outcome, result, options)
+    }
+
+    /**
+     * Tries to identify a file by name once its bytes have come up empty.
+     *
+     * Returns `null` when the fallback is switched off or nothing scores high enough, so the
+     * caller can keep whatever unmatched status it already had.
+     */
+    private fun fuzzyFallback(
+        file: RomFile,
+        fuzzy: Lazy<FuzzyTitleMatcher>,
+        options: ScanOptions,
+        sizeMismatch: Boolean,
+        hashes: FileHashes = FileHashes(),
+    ): ScannedRom? {
+        if (!options.fuzzyMatching) return null
+
+        return when (val result = fuzzy.value.match(file.name, file.extension)) {
+            is FuzzyResult.Matched -> ScannedRom(
+                file = file,
+                hashes = hashes,
+                status = MatchStatus.FuzzyMatched(
+                    entry = result.entry,
+                    confidence = result.confidence,
+                    query = result.query,
+                    sizeMismatch = sizeMismatch,
+                ),
+                targetName = RomNaming.targetName(
+                    entry = result.entry,
+                    currentName = file.name,
+                    policy = fuzzyNamingPolicy(result.entry, file, options),
+                ),
+                // Never ticked by default: the bytes were not verified, so applying the
+                // rename has to be a decision the user makes.
+                selected = false,
+            )
+
+            is FuzzyResult.Ambiguous -> ScannedRom(
+                file = file,
+                hashes = hashes,
+                status = MatchStatus.FuzzyAmbiguous(result.candidates, result.confidence),
+                selected = false,
+            )
+
+            FuzzyResult.NoMatch -> null
+        }
+    }
+
+    /**
+     * Text matches keep the extension already on disk.
+     *
+     * The official name is only a guess here, so rewriting a `.iso` to the DAT's `.cue`
+     * would assert a change of format on no evidence at all. A hash match has earned the
+     * right to do that; a name match has not.
+     */
+    private fun fuzzyNamingPolicy(
+        entry: DatEntry,
+        file: RomFile,
+        options: ScanOptions,
+    ): NamingPolicy {
+        val datExtension = entry.officialFileName.substringAfterLast('.', "")
+        return if (datExtension.equals(file.extension, ignoreCase = true)) {
+            options.namingPolicy
+        } else {
+            NamingPolicy.GAME_TITLE_KEEP_EXTENSION
+        }
     }
 
     private fun toScannedRom(

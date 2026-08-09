@@ -47,6 +47,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.romrenamer.app.core.dat.DatSourceOutcome
+import com.romrenamer.app.core.match.FuzzyTitleMatcher
 import com.romrenamer.app.core.match.ScanSummary
 import com.romrenamer.app.core.match.ScannedRom
 import com.romrenamer.app.core.rename.NamingPolicy
@@ -54,6 +55,7 @@ import com.romrenamer.app.core.rename.RenameOutcome
 import com.romrenamer.app.core.rename.RenameReport
 import com.romrenamer.app.ui.components.RomRow
 import com.romrenamer.app.ui.theme.LocalStatusColors
+import kotlin.math.abs
 
 /**
  * The single screen: pick a folder, pick a DAT, scan, review, rename.
@@ -156,6 +158,8 @@ fun MainScreen(viewModel: MainViewModel, modifier: Modifier = Modifier) {
             state = state,
             onNamingPolicy = viewModel::setNamingPolicy,
             onInspectArchives = viewModel::setInspectArchives,
+            onFuzzyMatching = viewModel::setFuzzyMatching,
+            onFuzzyThreshold = viewModel::setFuzzyThreshold,
             onDismiss = viewModel::dismissDialog,
         )
 
@@ -463,6 +467,8 @@ private fun ConfirmRenameDialog(
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val textMatches = candidates.count { it.isTextMatch }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Rename ${candidates.size} files?") },
@@ -473,6 +479,17 @@ private fun ConfirmRenameDialog(
                         "but renaming cannot be undone from inside the app.",
                     style = MaterialTheme.typography.bodyMedium,
                 )
+                if (textMatches > 0) {
+                    // The one thing worth interrupting for: these names were guessed from
+                    // the existing file name, with nothing about the bytes verified.
+                    Text(
+                        text = "$textMatches of these were matched on file name only, not " +
+                            "by hash. Check those before continuing.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = LocalStatusColors.current.warning,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
                 Column(modifier = Modifier.height(220.dp).padding(top = 12.dp)) {
                     LazyColumn {
                         items(items = candidates.take(PREVIEW_LIMIT), key = { it.id }) { rom ->
@@ -483,8 +500,17 @@ private fun ConfirmRenameDialog(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                                 Text(
-                                    "→ ${rom.targetName}",
+                                    text = if (rom.isTextMatch) {
+                                        "→ ${rom.targetName}  (text match)"
+                                    } else {
+                                        "→ ${rom.targetName}"
+                                    },
                                     style = MaterialTheme.typography.bodySmall,
+                                    color = if (rom.isTextMatch) {
+                                        LocalStatusColors.current.warning
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurface
+                                    },
                                 )
                             }
                         }
@@ -643,6 +669,8 @@ private fun OptionsDialog(
     state: MainUiState,
     onNamingPolicy: (NamingPolicy) -> Unit,
     onInspectArchives: (Boolean) -> Unit,
+    onFuzzyMatching: (Boolean) -> Unit,
+    onFuzzyThreshold: (Float) -> Unit,
     onDismiss: () -> Unit,
 ) {
     AlertDialog(
@@ -681,6 +709,37 @@ private fun OptionsDialog(
                     }
                     Switch(checked = state.inspectArchives, onCheckedChange = onInspectArchives)
                 }
+
+                HorizontalDivider()
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "Match scrubbed rips by name",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Text(
+                            "When no hash fits, compare the cleaned-up file name against " +
+                                "DAT titles. Results are flagged as unverified.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(checked = state.fuzzyMatching, onCheckedChange = onFuzzyMatching)
+                }
+
+                if (state.fuzzyMatching) {
+                    Text("Required similarity", style = MaterialTheme.typography.labelLarge)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        THRESHOLD_CHOICES.forEach { (label, value) ->
+                            FilterChip(
+                                selected = abs(state.fuzzyThreshold - value) < 0.001f,
+                                onClick = { onFuzzyThreshold(value) },
+                                label = { Text(label) },
+                            )
+                        }
+                    }
+                }
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
@@ -688,7 +747,8 @@ private fun OptionsDialog(
 }
 
 private fun summaryLine(summary: ScanSummary): String = buildString {
-    append("${summary.matched} matched")
+    append("${summary.matched} hash matched")
+    if (summary.textMatched > 0) append(" · ${summary.textMatched} text matched")
     append(" · ${summary.needsRename} to rename")
     if (summary.alreadyCorrect > 0) append(" · ${summary.alreadyCorrect} ok")
     if (summary.ambiguous > 0) append(" · ${summary.ambiguous} ambiguous")
@@ -700,6 +760,7 @@ private fun countFor(summary: ScanSummary, filter: RowFilter): Int = when (filte
     RowFilter.ALL -> summary.total
     RowFilter.TO_RENAME -> summary.needsRename
     RowFilter.MATCHED -> summary.matched
+    RowFilter.TEXT_MATCHED -> summary.textMatched
     RowFilter.UNMATCHED -> summary.unmatched
     RowFilter.PROBLEMS -> summary.ambiguous + summary.failed
 }
@@ -708,6 +769,13 @@ private fun progressOf(completed: Int, total: Int): Float? =
     if (total <= 0) null else (completed.toFloat() / total).coerceIn(0f, 1f)
 
 private const val PREVIEW_LIMIT = 200
+
+/** Confidence presets for the text-match fallback. */
+private val THRESHOLD_CHOICES = listOf(
+    "Strict" to 0.95f,
+    "Balanced" to FuzzyTitleMatcher.DEFAULT_THRESHOLD,
+    "Loose" to 0.75f,
+)
 
 /**
  * DATs are published as `.dat` or `.xml`; providers report them inconsistently, so the

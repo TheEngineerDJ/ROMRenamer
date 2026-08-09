@@ -1,6 +1,7 @@
 package com.romrenamer.app.ui
 
 import com.romrenamer.app.core.dat.DatSourceOutcome
+import com.romrenamer.app.core.match.FuzzyTitleMatcher
 import com.romrenamer.app.core.match.MatchStatus
 import com.romrenamer.app.core.match.ScanSummary
 import com.romrenamer.app.core.match.ScannedRom
@@ -31,7 +32,8 @@ sealed interface Phase {
 enum class RowFilter(val label: String) {
     ALL("All"),
     TO_RENAME("To rename"),
-    MATCHED("Matched"),
+    MATCHED("Hash matched"),
+    TEXT_MATCHED("Text matched"),
     UNMATCHED("Unmatched"),
     PROBLEMS("Problems"),
     ;
@@ -40,8 +42,11 @@ enum class RowFilter(val label: String) {
         ALL -> true
         TO_RENAME -> rom.needsRename
         MATCHED -> rom.status is MatchStatus.Matched
+        TEXT_MATCHED -> rom.status is MatchStatus.FuzzyMatched
         UNMATCHED -> rom.status is MatchStatus.Unmatched || rom.status is MatchStatus.SizeExcluded
-        PROBLEMS -> rom.status is MatchStatus.Ambiguous || rom.status is MatchStatus.Failed
+        PROBLEMS -> rom.status is MatchStatus.Ambiguous ||
+            rom.status is MatchStatus.FuzzyAmbiguous ||
+            rom.status is MatchStatus.Failed
     }
 }
 
@@ -104,6 +109,8 @@ data class MainUiState(
     val rowFilter: RowFilter = RowFilter.ALL,
     val namingPolicy: NamingPolicy = NamingPolicy.DAT_ROM_NAME,
     val inspectArchives: Boolean = true,
+    val fuzzyMatching: Boolean = true,
+    val fuzzyThreshold: Float = FuzzyTitleMatcher.DEFAULT_THRESHOLD,
     val dialog: UiDialog? = null,
     /** One-shot text for the snackbar. */
     val message: String? = null,

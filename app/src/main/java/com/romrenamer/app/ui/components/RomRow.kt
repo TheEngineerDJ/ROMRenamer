@@ -93,8 +93,18 @@ private fun SecondaryLine(rom: ScannedRom) {
             rom.hashes.crc32?.let { append(" · CRC32 $it") }
         }
 
+        is MatchStatus.FuzzyMatched -> buildString {
+            append(status.entry.game.name)
+            append(" · name only, ${status.confidencePercent}% similar")
+            append(if (status.sizeMismatch) " · size not in DAT" else " · no hash match")
+        }
+
         is MatchStatus.Ambiguous ->
             "${status.candidates.size} possible matches: " +
+                status.candidates.take(3).joinToString(", ") { it.game.name }
+
+        is MatchStatus.FuzzyAmbiguous ->
+            "Name fits ${status.candidates.size} titles equally: " +
                 status.candidates.take(3).joinToString(", ") { it.game.name }
 
         is MatchStatus.Failed -> status.message
@@ -122,8 +132,11 @@ private fun SecondaryLine(rom: ScannedRom) {
 private fun StatusBadge(status: MatchStatus, modifier: Modifier = Modifier) {
     val statusColors = LocalStatusColors.current
     val (label, color) = when (status) {
-        is MatchStatus.Matched -> "Matched" to statusColors.success
+        is MatchStatus.Matched -> "Hash match" to statusColors.success
+        // Amber, not green: the name fits but nothing about the bytes was verified.
+        is MatchStatus.FuzzyMatched -> "Text matched" to statusColors.warning
         is MatchStatus.Ambiguous -> "Ambiguous" to statusColors.warning
+        is MatchStatus.FuzzyAmbiguous -> "Ambiguous" to statusColors.warning
         is MatchStatus.Failed -> "Error" to MaterialTheme.colorScheme.error
         MatchStatus.Unmatched -> "No match" to MaterialTheme.colorScheme.onSurfaceVariant
         MatchStatus.SizeExcluded -> "Skipped" to MaterialTheme.colorScheme.onSurfaceVariant

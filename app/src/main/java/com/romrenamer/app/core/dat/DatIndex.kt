@@ -91,7 +91,6 @@ class DatIndexBuilder {
     private val byCrc32 = HashMap<String, MutableList<DatEntry>>()
     private val sizes = HashSet<Long>()
     private val available = mutableSetOf<HashAlgorithm>()
-    private val sources = mutableListOf<String>()
     private var sizeIndexComplete = true
     private var romCount = 0
 
@@ -103,16 +102,18 @@ class DatIndexBuilder {
     fun addHeader(header: DatHeader) = apply { headers += header }
 
     fun addGame(game: DatGame, source: String) = apply {
-        games += game
-        sources += source
-        for (rom in game.roms) {
+        // Stamping the source here keeps it available to anything walking `games` later,
+        // notably the fuzzy title index, which has to rebuild DatEntry values from scratch.
+        val stamped = if (game.source == source) game else game.copy(source = source)
+        games += stamped
+        for (rom in stamped.roms) {
             // Entries flagged nodump/baddump carry placeholder hashes; indexing them would
             // point real files at the wrong release.
             if (rom.isDumpKnownBad) continue
             romCount++
             rom.crc32?.let { crc ->
                 available += HashAlgorithm.CRC32
-                byCrc32.getOrPut(crc) { mutableListOf() } += DatEntry(game, rom, source)
+                byCrc32.getOrPut(crc) { mutableListOf() } += DatEntry(stamped, rom, source)
             }
             if (rom.md5 != null) available += HashAlgorithm.MD5
             if (rom.sha1 != null) available += HashAlgorithm.SHA1
@@ -150,8 +151,7 @@ class DatIndexBuilder {
     /** Indexes by a stronger hash for the rare DAT that omits CRC32 entirely. */
     private fun buildFallbackIndex(algorithm: HashAlgorithm): Map<String, List<DatEntry>> {
         val map = HashMap<String, MutableList<DatEntry>>()
-        games.forEachIndexed { position, game ->
-            val source = sources[position]
+        for (game in games) {
             for (rom in game.roms) {
                 if (rom.isDumpKnownBad) continue
                 val hash = when (algorithm) {
@@ -159,7 +159,7 @@ class DatIndexBuilder {
                     HashAlgorithm.MD5 -> rom.md5
                     HashAlgorithm.CRC32 -> rom.crc32
                 } ?: continue
-                map.getOrPut(hash) { mutableListOf() } += DatEntry(game, rom, source)
+                map.getOrPut(hash) { mutableListOf() } += DatEntry(game, rom, game.source)
             }
         }
         return map.mapValues { it.value.toList() }

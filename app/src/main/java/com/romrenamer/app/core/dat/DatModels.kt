@@ -63,6 +63,8 @@ data class DatGame(
     val category: String? = null,
     val cloneOf: String? = null,
     val roms: List<DatRom> = emptyList(),
+    /** [DatHeader.displayName] of the DAT this game came from; filled in when indexed. */
+    val source: String = "",
 )
 
 /** A hit in the index: the release plus the specific file inside it that matched. */
