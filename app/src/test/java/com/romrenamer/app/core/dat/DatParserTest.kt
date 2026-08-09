@@ -59,9 +59,35 @@ class DatParserTest {
         assertEquals(1, index.gameCount)
         assertEquals(3, index.romCount)
 
-        val track = index.findBySha1("da39a3ee5e6b4b0d3255bfef95601890afd80709")
+        val track = index.findByCrc32("55667788")
         assertEquals(1, track.size)
         assertEquals("Some Game (USA) (Track 2).bin", track.first().officialFileName)
+    }
+
+    @Test
+    fun `indexes by CRC32 only, even when stronger hashes are published`() = runTest {
+        val builder = DatIndexBuilder()
+        parser.parse(NO_INTRO_DAT.stream(), builder)
+        val index = builder.build()
+
+        // One map however many DATs are merged; stronger hashes confirm candidates
+        // directly rather than through an index of their own.
+        assertEquals(HashAlgorithm.CRC32, index.primaryAlgorithm)
+        assertTrue(index.findByMd5("cdd3c8c37322978ca8669b34bc89c804").isEmpty())
+        assertTrue(index.findByCrc32("b19ed489").isNotEmpty())
+    }
+
+    @Test
+    fun `falls back to a stronger hash when a DAT publishes no CRC32`() = runTest {
+        val builder = DatIndexBuilder()
+        parser.parse(SHA1_ONLY_DAT.stream(), builder)
+        val index = builder.build()
+
+        assertEquals(HashAlgorithm.SHA1, index.primaryAlgorithm)
+        assertEquals(
+            "Hashless (USA).bin",
+            index.findBySha1("da39a3ee5e6b4b0d3255bfef95601890afd80709").first().officialFileName,
+        )
     }
 
     @Test
@@ -233,6 +259,17 @@ class DatParserTest {
               </game>
               <game name="Good Dump">
                 <rom name="Good Dump.bin" size="1024" crc="12345678"/>
+              </game>
+            </datafile>
+        """.trimIndent()
+
+        val SHA1_ONLY_DAT = """
+            <?xml version="1.0"?>
+            <datafile>
+              <header><name>SHA-1 only</name></header>
+              <game name="Hashless (USA)">
+                <rom name="Hashless (USA).bin" size="2048"
+                     sha1="da39a3ee5e6b4b0d3255bfef95601890afd80709"/>
               </game>
             </datafile>
         """.trimIndent()

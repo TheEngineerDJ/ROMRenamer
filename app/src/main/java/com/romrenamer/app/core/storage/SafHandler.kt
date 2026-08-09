@@ -35,14 +35,23 @@ class SafHandler(context: Context) {
      * @return `true` when the grant was taken; `false` if the provider refused it, in which
      *   case the URI is still usable for this process but must not be stored.
      */
-    fun persistTreePermission(treeUri: Uri): Boolean = try {
-        resolver.takePersistableUriPermission(
-            treeUri,
-            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
-        )
+    fun persistTreePermission(treeUri: Uri): Boolean =
+        persist(treeUri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+
+    /**
+     * Persists read-only access, which is all a DAT file or a folder of DAT files needs.
+     *
+     * Taking only the read flag keeps the app's standing access to the smallest thing that
+     * works — the DAT selection is never written to.
+     */
+    fun persistReadPermission(uri: Uri): Boolean =
+        persist(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+    private fun persist(uri: Uri, modeFlags: Int): Boolean = try {
+        resolver.takePersistableUriPermission(uri, modeFlags)
         true
     } catch (e: SecurityException) {
-        Log.w(TAG, "Could not persist permission for $treeUri", e)
+        Log.w(TAG, "Could not persist permission for $uri", e)
         false
     }
 
@@ -63,6 +72,10 @@ class SafHandler(context: Context) {
             it.uri == treeUri && it.isReadPermission && it.isWritePermission
         }
 
+    /** `true` if a previously saved URI can still be read. */
+    fun hasPersistedReadPermission(uri: Uri): Boolean =
+        resolver.persistedUriPermissions.any { it.uri == uri && it.isReadPermission }
+
     fun persistedTrees(): List<Uri> =
         resolver.persistedUriPermissions.filter { it.isReadPermission }.map { it.uri }
 
@@ -82,6 +95,23 @@ class SafHandler(context: Context) {
      */
     fun documentFile(documentUri: Uri): DocumentFile? =
         runCatching { DocumentFile.fromTreeUri(appContext, documentUri) }.getOrNull()
+
+    /**
+     * Name and size of a standalone document, as returned by `ACTION_OPEN_DOCUMENT`.
+     *
+     * Files picked individually are not part of a granted tree, so they have to be read
+     * through [DocumentFile.fromSingleUri]; a single document supports the metadata queries
+     * even though it cannot be renamed.
+     */
+    fun documentInfo(documentUri: Uri): DocumentInfo? {
+        val document = runCatching { DocumentFile.fromSingleUri(appContext, documentUri) }
+            .getOrNull() ?: return null
+        val name = runCatching { document.name }.getOrNull()
+            ?: documentUri.lastPathSegment?.substringAfterLast('/')
+            ?: return null
+        val size = runCatching { document.length() }.getOrNull()?.takeIf { it > 0 }
+        return DocumentInfo(uri = documentUri, name = name, sizeBytes = size)
+    }
 
     /**
      * Recursively lists every file under [treeUri] that [filter] accepts.
@@ -199,6 +229,9 @@ class SafHandler(context: Context) {
         )
     }
 }
+
+/** Metadata for a standalone document the user picked. */
+data class DocumentInfo(val uri: Uri, val name: String, val sizeBytes: Long?)
 
 /** Raised when a directory grant is missing, revoked, or otherwise unusable. */
 class StorageAccessException(message: String, cause: Throwable? = null) : Exception(message, cause)

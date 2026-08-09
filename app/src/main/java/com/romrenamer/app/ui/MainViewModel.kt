@@ -2,16 +2,14 @@ package com.romrenamer.app.ui
 
 import android.app.Application
 import android.content.Context
-import android.content.Intent
 import android.net.Uri
 import android.util.Log
-import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.romrenamer.app.core.dat.DatIndex
-import com.romrenamer.app.core.dat.DatIndexBuilder
-import com.romrenamer.app.core.dat.DatParseException
-import com.romrenamer.app.core.dat.DatParser
+import com.romrenamer.app.core.dat.DatLoadResult
+import com.romrenamer.app.core.dat.DatLoader
+import com.romrenamer.app.core.dat.DatSource
 import com.romrenamer.app.core.match.MatchStatus
 import com.romrenamer.app.core.match.ScanSummary
 import com.romrenamer.app.core.match.ScannedRom
@@ -24,7 +22,9 @@ import com.romrenamer.app.core.scan.RomScanner
 import com.romrenamer.app.core.scan.ScanEvent
 import com.romrenamer.app.core.scan.ScanOptions
 import com.romrenamer.app.core.hash.HashEngine
+import com.romrenamer.app.core.storage.RomFileFilter
 import com.romrenamer.app.core.storage.SafHandler
+import java.io.FileNotFoundException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -36,8 +36,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * Owns the app's state machine: hold the folder grant, load a DAT, run a scan, apply
- * renames.
+ * Owns the app's state machine: hold the folder grant, load the DAT database, run a scan,
+ * apply renames.
  *
  * All long-running work lives in [viewModelScope] and is cancellable, so rotating the
  * device keeps a scan alive while leaving the screen kills it cleanly.
@@ -48,15 +48,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val hashEngine = HashEngine(application.contentResolver)
     private val scanner = RomScanner(safHandler, hashEngine)
     private val renamer = BatchRenamer(safHandler)
-    private val datParser = DatParser()
     private val prefs = application.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    private val datLoader = DatLoader(open = ::openDatSource)
 
     private val _state = MutableStateFlow(MainUiState())
     val state: StateFlow<MainUiState> = _state.asStateFlow()
 
     private var datIndex: DatIndex = DatIndex.EMPTY
     private var treeUri: Uri? = null
-    private var datUri: Uri? = null
+    private var datJob: Job? = null
     private var scanJob: Job? = null
 
     /** Mutable working copy of the row list, so per-file updates stay O(1). */
@@ -83,74 +84,156 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun onDatPicked(uri: Uri?) {
-        if (uri == null) return
-        viewModelScope.launch { loadDat(uri, persist = true) }
-    }
+    /** Individually picked DAT files, from `ACTION_OPEN_DOCUMENT` with multi-select. */
+    fun onDatFilesPicked(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        // A provider that refuses a persistable grant still allows reads for this process,
+        // so a failure here only costs the selection on next launch.
+        uris.forEach { safHandler.persistReadPermission(it) }
 
-    private suspend fun loadDat(uri: Uri, persist: Boolean) {
-        val application = getApplication<Application>()
-        val document = runCatching { DocumentFile.fromSingleUri(application, uri) }.getOrNull()
-        val fileName = document?.name ?: uri.lastPathSegment ?: "DAT file"
-        val totalBytes = document?.length()?.takeIf { it > 0 }
-
-        _state.update {
-            it.copy(phase = Phase.LoadingDat(fileName, 0, null), message = null)
-        }
-
-        try {
-            if (persist) {
-                runCatching {
-                    application.contentResolver.takePersistableUriPermission(
-                        uri,
-                        Intent.FLAG_GRANT_READ_URI_PERMISSION,
-                    )
-                }
-            }
-
-            val builder = DatIndexBuilder()
-            withContext(Dispatchers.IO) {
-                val stream = application.contentResolver.openInputStream(uri)
-                    ?: throw DatParseException("Could not open the selected DAT file.")
-                stream.use { input ->
-                    datParser.parse(input, builder, totalBytes) { progress ->
-                        _state.update {
-                            it.copy(
-                                phase = Phase.LoadingDat(
-                                    fileName = fileName,
-                                    gamesParsed = progress.gamesParsed,
-                                    fraction = progress.fraction,
-                                ),
-                            )
-                        }
+        datJob?.cancel()
+        datJob = viewModelScope.launch {
+            val sources = withContext(Dispatchers.IO) {
+                uris.mapNotNull { uri ->
+                    safHandler.documentInfo(uri)?.let { info ->
+                        DatSource(uri = info.uri, name = info.name, sizeBytes = info.sizeBytes)
                     }
                 }
             }
+            if (sources.isEmpty()) {
+                _state.update { it.copy(message = "Those files could not be read.") }
+                return@launch
+            }
+            rememberSelection(fileUris = sources.map { it.uri })
+            loadDats(sources, DatSelection.Files(sources.size))
+        }
+    }
 
-            datIndex = builder.build()
-            datUri = uri
-            if (persist) prefs.edit().putString(KEY_DAT_URI, uri.toString()).apply()
+    /**
+     * A whole folder of DAT files, from `ACTION_OPEN_DOCUMENT_TREE`.
+     *
+     * Every `.dat` and `.xml` under the folder is parsed and merged, however deeply nested,
+     * so a user who keeps a No-Intro download folder can point at it once and match a mixed
+     * ROM library without picking the right file per system.
+     */
+    fun onDatFolderPicked(uri: Uri?) {
+        if (uri == null) return
+        safHandler.persistReadPermission(uri)
+        datJob?.cancel()
+        datJob = viewModelScope.launch {
+            rememberSelection(treeUri = uri)
+            loadDatFolder(uri)
+        }
+    }
 
+    private suspend fun loadDatFolder(uri: Uri) {
+        val folderName = safHandler.treeDisplayName(uri)
+        _state.update {
+            it.copy(phase = Phase.LoadingDats(0, 0, folderName, 0, null), message = null)
+        }
+
+        val files = try {
+            safHandler.listFilesRecursively(uri, RomFileFilter.DAT_FILES)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not list DAT folder", e)
+            _state.update {
+                it.copy(phase = Phase.Idle, message = e.message ?: "Could not read that folder.")
+            }
+            return
+        }
+
+        if (files.isEmpty()) {
             _state.update {
                 it.copy(
                     phase = Phase.Idle,
-                    datName = datIndex.displayName,
-                    datGameCount = datIndex.gameCount,
-                    datRomCount = datIndex.romCount,
-                    message = "Loaded ${datIndex.gameCount} games from $fileName.",
+                    message = "No .dat or .xml files found in \"$folderName\".",
                 )
             }
-            // Row targets were computed against the previous DAT, so they no longer apply.
-            if (workingRoms.isNotEmpty()) clearResults()
+            return
+        }
+
+        val sources = files.map { file ->
+            DatSource(
+                uri = file.uri,
+                name = file.name,
+                sizeBytes = file.size.takeIf { size -> size > 0 },
+                relativePath = file.relativePath,
+            )
+        }
+        loadDats(sources, DatSelection.Folder(folderName))
+    }
+
+    /** Parses every source into one merged index and publishes the result. */
+    private suspend fun loadDats(sources: List<DatSource>, selection: DatSelection) {
+        _state.update {
+            it.copy(
+                phase = Phase.LoadingDats(1, sources.size, sources.first().name, 0, null),
+                message = null,
+            )
+        }
+
+        val result: DatLoadResult = try {
+            withContext(Dispatchers.IO) {
+                datLoader.load(sources) { progress ->
+                    _state.update {
+                        it.copy(
+                            phase = Phase.LoadingDats(
+                                fileNumber = progress.fileNumber,
+                                fileCount = progress.fileCount,
+                                fileName = progress.fileName,
+                                gamesParsed = progress.gamesParsed,
+                                fraction = progress.overallFraction,
+                            ),
+                        )
+                    }
+                }
+            }
         } catch (e: CancellationException) {
+            _state.update { it.copy(phase = Phase.Idle) }
             throw e
         } catch (e: Exception) {
             Log.w(TAG, "DAT load failed", e)
             _state.update {
-                it.copy(phase = Phase.Idle, message = e.message ?: "Could not read that DAT file.")
+                it.copy(phase = Phase.Idle, message = e.message ?: "Could not read those DAT files.")
             }
+            return
         }
+
+        datIndex = result.index
+        val library = DatLibrary(
+            selection = selection,
+            outcomes = result.outcomes,
+            gameCount = datIndex.gameCount,
+            romCount = datIndex.romCount,
+            truncated = result.truncated,
+        )
+
+        _state.update {
+            it.copy(phase = Phase.Idle, datLibrary = library, message = loadMessage(library))
+        }
+        // Row targets were computed against the previous database, so they no longer apply.
+        if (workingRoms.isNotEmpty()) clearResults()
     }
+
+    private fun loadMessage(library: DatLibrary): String = when {
+        library.loadedCount == 0 ->
+            "No readable DAT files in that selection."
+        library.truncated ->
+            "Loaded ${library.gameCount} games, then stopped at the size limit. " +
+                "Select fewer DATs for a complete database."
+        library.rejectedCount > 0 ->
+            "Merged ${library.loadedCount} DATs (${library.gameCount} games); " +
+                "${library.rejectedCount} files were not DATs."
+        else ->
+            "Merged ${library.loadedCount} DATs — ${library.gameCount} games."
+    }
+
+    /** Opens a DAT for the loader, which is deliberately unaware of `ContentResolver`. */
+    private fun openDatSource(source: DatSource) =
+        getApplication<Application>().contentResolver.openInputStream(source.uri)
+            ?: throw FileNotFoundException("The storage provider returned no data.")
 
     // ---------------------------------------------------------------- scanning
 
@@ -160,7 +243,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         if (datIndex.isEmpty) {
-            _state.update { it.copy(message = "Load a No-Intro or Redump DAT file first.") }
+            _state.update { it.copy(message = "Load one or more DAT files first.") }
             return
         }
         if (scanJob?.isActive == true) return
@@ -410,7 +493,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** Reuses last session's folder and DAT when their permission grants survived. */
+    /**
+     * Records the DAT selection so the next launch can rebuild the same database.
+     *
+     * The two kinds are mutually exclusive — picking a folder replaces a file selection and
+     * vice versa — so the unused key is always cleared.
+     */
+    private fun rememberSelection(treeUri: Uri? = null, fileUris: List<Uri>? = null) {
+        prefs.edit().apply {
+            if (treeUri != null) {
+                putString(KEY_DAT_TREE_URI, treeUri.toString())
+                remove(KEY_DAT_FILE_URIS)
+            } else {
+                remove(KEY_DAT_TREE_URI)
+                putStringSet(KEY_DAT_FILE_URIS, fileUris.orEmpty().mapTo(mutableSetOf()) { it.toString() })
+            }
+        }.apply()
+    }
+
+    /** Reuses last session's ROM folder and DAT selection when their grants survived. */
     private fun restoreSavedSelections() {
         prefs.getString(KEY_NAMING_POLICY, null)
             ?.let { name -> NamingPolicy.entries.firstOrNull { it.name == name } }
@@ -427,15 +528,40 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        prefs.getString(KEY_DAT_URI, null)?.let { saved ->
+        restoreDatSelection()
+    }
+
+    private fun restoreDatSelection() {
+        prefs.getString(KEY_DAT_TREE_URI, null)?.let { saved ->
             val uri = Uri.parse(saved)
-            val stillGranted = getApplication<Application>().contentResolver
-                .persistedUriPermissions.any { it.uri == uri && it.isReadPermission }
-            if (stillGranted) {
-                viewModelScope.launch { loadDat(uri, persist = false) }
+            if (safHandler.hasPersistedReadPermission(uri)) {
+                datJob = viewModelScope.launch { loadDatFolder(uri) }
             } else {
-                prefs.edit().remove(KEY_DAT_URI).apply()
+                prefs.edit().remove(KEY_DAT_TREE_URI).apply()
             }
+            return
+        }
+
+        val saved = prefs.getStringSet(KEY_DAT_FILE_URIS, null).orEmpty()
+        if (saved.isEmpty()) return
+
+        // Individual grants are revoked independently, so a partly-surviving selection is
+        // reloaded from whatever is left rather than discarded wholesale.
+        val stillGranted = saved.map(Uri::parse).filter(safHandler::hasPersistedReadPermission)
+        if (stillGranted.isEmpty()) {
+            prefs.edit().remove(KEY_DAT_FILE_URIS).apply()
+            return
+        }
+
+        datJob = viewModelScope.launch {
+            val sources = withContext(Dispatchers.IO) {
+                stillGranted.mapNotNull { uri ->
+                    safHandler.documentInfo(uri)?.let { info ->
+                        DatSource(uri = info.uri, name = info.name, sizeBytes = info.sizeBytes)
+                    }
+                }
+            }
+            if (sources.isNotEmpty()) loadDats(sources, DatSelection.Files(sources.size))
         }
     }
 
@@ -443,7 +569,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         const val TAG = "MainViewModel"
         const val PREFS = "rom_renamer"
         const val KEY_TREE_URI = "tree_uri"
-        const val KEY_DAT_URI = "dat_uri"
+        const val KEY_DAT_TREE_URI = "dat_tree_uri"
+        const val KEY_DAT_FILE_URIS = "dat_file_uris"
         const val KEY_NAMING_POLICY = "naming_policy"
         const val KEY_INSPECT_ARCHIVES = "inspect_archives"
         const val EMIT_INTERVAL_MS = 120L

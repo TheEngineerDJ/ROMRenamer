@@ -64,5 +64,11 @@ data class RomFileFilter(
             // Archives
             "zip", "7z", "rar",
         )
+
+        /** Extensions used by No-Intro and Redump DAT downloads. */
+        val DAT_EXTENSIONS: Set<String> = setOf("dat", "xml")
+
+        /** Picks up every DAT in a folder tree, however deeply it is nested. */
+        val DAT_FILES: RomFileFilter = RomFileFilter(extensions = DAT_EXTENSIONS)
     }
 }

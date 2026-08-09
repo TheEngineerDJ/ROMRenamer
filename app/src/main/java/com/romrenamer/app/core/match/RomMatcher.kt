@@ -2,6 +2,7 @@ package com.romrenamer.app.core.match
 
 import com.romrenamer.app.core.dat.DatEntry
 import com.romrenamer.app.core.dat.DatIndex
+import com.romrenamer.app.core.dat.DatRom
 import com.romrenamer.app.core.hash.FileHashes
 import com.romrenamer.app.core.hash.HashAlgorithm
 
@@ -28,90 +29,93 @@ sealed interface MatchResult {
 /**
  * Matches file hashes against a [DatIndex].
  *
- * The scan hashes with CRC32 first because it is the cheapest and every DAT publishes it.
- * CRC32 is only 32 bits, though, so collisions are possible and DATs legitimately list the
- * same bytes under several releases — when a CRC lookup is not decisive the matcher asks
- * for MD5/SHA-1 and the file is re-read. In practice that second pass is rare.
+ * Lookup happens once, against the index's [DatIndex.primaryAlgorithm] — normally CRC32,
+ * because it is the cheapest to compute and every DAT publishes it. That produces a short
+ * candidate list, and any stronger hash the caller has already computed is then checked
+ * directly against those candidates. This is what lets the index carry a single hash map
+ * however many DATs are merged into it.
+ *
+ * CRC32 is only 32 bits, so a single hit is not always decisive: collisions exist and DATs
+ * legitimately list the same bytes under several releases. When the candidates disagree,
+ * the matcher reports which stronger hashes would separate them so the file can be re-read
+ * once, for just those algorithms.
  */
 class RomMatcher(private val index: DatIndex) {
 
     /** The cheapest algorithm set worth computing on the first pass over a file. */
-    fun initialAlgorithms(): Set<HashAlgorithm> = when {
-        HashAlgorithm.CRC32 in index.availableAlgorithms -> setOf(HashAlgorithm.CRC32)
-        HashAlgorithm.MD5 in index.availableAlgorithms -> setOf(HashAlgorithm.MD5)
-        HashAlgorithm.SHA1 in index.availableAlgorithms -> setOf(HashAlgorithm.SHA1)
-        else -> setOf(HashAlgorithm.CRC32)
-    }
+    fun initialAlgorithms(): Set<HashAlgorithm> =
+        setOf(index.primaryAlgorithm ?: HashAlgorithm.CRC32)
 
     fun match(hashes: FileHashes): MatchResult {
-        // Strongest first: a SHA-1 hit needs no corroboration, a CRC32 hit might.
-        for (algorithm in STRENGTH_ORDER) {
-            val hash = hashes[algorithm] ?: continue
-            val candidates = index.find(algorithm, hash)
-            if (candidates.isEmpty()) {
-                // A miss on a strong hash is conclusive — weaker hashes cannot rescue it.
-                if (algorithm != HashAlgorithm.CRC32) return MatchResult.NotFound
-                continue
-            }
-            return resolve(candidates, algorithm, hashes)
-        }
-        return MatchResult.NotFound
-    }
+        val primary = index.primaryAlgorithm ?: return MatchResult.NotFound
+        val primaryHash = hashes[primary] ?: return MatchResult.NotFound
 
-    private fun resolve(
-        candidates: List<DatEntry>,
-        via: HashAlgorithm,
-        hashes: FileHashes,
-    ): MatchResult {
-        if (candidates.size == 1) return MatchResult.Found(candidates.first(), via)
+        val candidates = index.find(primary, primaryHash)
+        if (candidates.isEmpty()) return MatchResult.NotFound
+
+        // A stronger hash that contradicts a candidate rules it out; one the DAT does not
+        // publish for that candidate cannot say anything either way.
+        val narrowed = candidates.filter { entry ->
+            CONFIRMING.all { algorithm ->
+                val fileHash = hashes[algorithm]
+                val datHash = entry.rom[algorithm]
+                fileHash == null || datHash == null || fileHash == datHash
+            }
+        }
+        if (narrowed.isEmpty()) return MatchResult.NotFound
 
         // Several DAT entries can describe the same bytes — a game listed in both a parent
-        // and a clone set, or the same dump in two merged DATs. If they all agree on the
-        // file name there is nothing for the user to decide.
-        val distinctNames = candidates.distinctBy { it.officialFileName }
-        if (distinctNames.size == 1) return MatchResult.Found(distinctNames.first(), via)
-
-        val stronger = strongerAlgorithmsFor(candidates, hashes)
-        if (stronger.isNotEmpty()) {
-            return MatchResult.NeedsStrongerHash(stronger, candidates)
+        // and a clone set, or the same dump present in two merged DATs. If they all agree
+        // on the file name there is nothing for the user to decide.
+        val distinct = narrowed.distinctBy { it.officialFileName }
+        if (distinct.size == 1) {
+            val entry = distinct.first()
+            return MatchResult.Found(entry, confirmedBy(entry, hashes, primary))
         }
-        return MatchResult.Ambiguous(distinctNames)
+
+        val separating = separatingAlgorithms(narrowed, hashes)
+        return if (separating.isNotEmpty()) {
+            MatchResult.NeedsStrongerHash(separating, narrowed)
+        } else {
+            MatchResult.Ambiguous(distinct)
+        }
     }
+
+    /** The strongest algorithm on which the file and the matched entry actually agree. */
+    private fun confirmedBy(
+        entry: DatEntry,
+        hashes: FileHashes,
+        fallback: HashAlgorithm,
+    ): HashAlgorithm = STRENGTH_ORDER.firstOrNull { algorithm ->
+        val fileHash = hashes[algorithm]
+        fileHash != null && fileHash == entry.rom[algorithm]
+    } ?: fallback
 
     /**
-     * Algorithms that are both published for every candidate and not yet computed — the
-     * only ones that could actually break the tie.
+     * Algorithms worth re-reading the file for: not yet computed, published for every
+     * candidate, and actually differing between them. An algorithm whose values are
+     * identical across the candidates could never break the tie.
      */
-    private fun strongerAlgorithmsFor(
+    private fun separatingAlgorithms(
         candidates: List<DatEntry>,
         hashes: FileHashes,
-    ): Set<HashAlgorithm> {
-        val computed = hashes.computed()
-        val usable = mutableSetOf<HashAlgorithm>()
-        if (HashAlgorithm.SHA1 !in computed && candidates.all { it.rom.sha1 != null }) {
-            usable += HashAlgorithm.SHA1
-        }
-        if (HashAlgorithm.MD5 !in computed && candidates.all { it.rom.md5 != null }) {
-            usable += HashAlgorithm.MD5
-        }
-        // Distinct candidates whose stronger hashes are all identical are the same dump
-        // under different names; re-reading the file would not help.
-        if (usable.size == 1) {
-            val only = usable.first()
-            val values = candidates.mapNotNull { it.rom[only] }.toSet()
-            if (values.size <= 1) return emptySet()
-        }
-        return usable
+    ): Set<HashAlgorithm> = CONFIRMING.filterTo(mutableSetOf()) { algorithm ->
+        hashes[algorithm] == null &&
+            candidates.all { it.rom[algorithm] != null } &&
+            candidates.mapTo(mutableSetOf()) { it.rom[algorithm] }.size > 1
     }
 
-    private operator fun com.romrenamer.app.core.dat.DatRom.get(algorithm: HashAlgorithm): String? =
-        when (algorithm) {
-            HashAlgorithm.CRC32 -> crc32
-            HashAlgorithm.MD5 -> md5
-            HashAlgorithm.SHA1 -> sha1
-        }
+    private operator fun DatRom.get(algorithm: HashAlgorithm): String? = when (algorithm) {
+        HashAlgorithm.CRC32 -> crc32
+        HashAlgorithm.MD5 -> md5
+        HashAlgorithm.SHA1 -> sha1
+    }
 
     private companion object {
+        /** Strongest first. */
         val STRENGTH_ORDER = listOf(HashAlgorithm.SHA1, HashAlgorithm.MD5, HashAlgorithm.CRC32)
+
+        /** Hashes strong enough to confirm or rule out a candidate found by CRC32. */
+        val CONFIRMING = listOf(HashAlgorithm.SHA1, HashAlgorithm.MD5)
     }
 }

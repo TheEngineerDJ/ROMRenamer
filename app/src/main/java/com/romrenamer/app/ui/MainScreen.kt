@@ -2,6 +2,7 @@ package com.romrenamer.app.ui
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -42,14 +43,17 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.romrenamer.app.core.dat.DatSourceOutcome
 import com.romrenamer.app.core.match.ScanSummary
 import com.romrenamer.app.core.match.ScannedRom
 import com.romrenamer.app.core.rename.NamingPolicy
 import com.romrenamer.app.core.rename.RenameOutcome
 import com.romrenamer.app.core.rename.RenameReport
 import com.romrenamer.app.ui.components.RomRow
+import com.romrenamer.app.ui.theme.LocalStatusColors
 
 /**
  * The single screen: pick a folder, pick a DAT, scan, review, rename.
@@ -67,9 +71,13 @@ fun MainScreen(viewModel: MainViewModel, modifier: Modifier = Modifier) {
         ActivityResultContracts.OpenDocumentTree(),
     ) { uri -> viewModel.onFolderPicked(uri) }
 
-    val datPicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument(),
-    ) { uri -> viewModel.onDatPicked(uri) }
+    val datFilePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris -> viewModel.onDatFilesPicked(uris) }
+
+    val datFolderPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
+    ) { uri -> viewModel.onDatFolderPicked(uri) }
 
     LaunchedEffect(state.message) {
         state.message?.let { message ->
@@ -105,7 +113,9 @@ fun MainScreen(viewModel: MainViewModel, modifier: Modifier = Modifier) {
             SetupCard(
                 state = state,
                 onPickFolder = { folderPicker.launch(null) },
-                onPickDat = { datPicker.launch(DAT_MIME_TYPES) },
+                onPickDatFiles = { datFilePicker.launch(DAT_MIME_TYPES) },
+                onPickDatFolder = { datFolderPicker.launch(null) },
+                onShowDatSources = { viewModel.showDialog(UiDialog.DatSources) },
                 onScan = viewModel::startScan,
             )
 
@@ -138,6 +148,10 @@ fun MainScreen(viewModel: MainViewModel, modifier: Modifier = Modifier) {
 
         is UiDialog.Report -> ReportDialog(dialog.report, viewModel::dismissDialog)
 
+        UiDialog.DatSources -> state.datLibrary?.let { library ->
+            DatSourcesDialog(library, viewModel::dismissDialog)
+        }
+
         UiDialog.Options -> OptionsDialog(
             state = state,
             onNamingPolicy = viewModel::setNamingPolicy,
@@ -153,7 +167,9 @@ fun MainScreen(viewModel: MainViewModel, modifier: Modifier = Modifier) {
 private fun SetupCard(
     state: MainUiState,
     onPickFolder: () -> Unit,
-    onPickDat: () -> Unit,
+    onPickDatFiles: () -> Unit,
+    onPickDatFolder: () -> Unit,
+    onShowDatSources: () -> Unit,
     onScan: () -> Unit,
 ) {
     Card(
@@ -169,21 +185,20 @@ private fun SetupCard(
             SetupLine(
                 label = "ROM folder",
                 value = state.folderName ?: "Not selected",
-                buttonText = if (state.hasFolder) "Change" else "Choose",
                 enabled = !state.phase.isBusy,
-                onClick = onPickFolder,
+            ) {
+                OutlinedButton(onClick = onPickFolder, enabled = !state.phase.isBusy) {
+                    Text(if (state.hasFolder) "Change" else "Choose")
+                }
+            }
+
+            DatSetupLine(
+                state = state,
+                onPickFiles = onPickDatFiles,
+                onPickFolder = onPickDatFolder,
+                onShowSources = onShowDatSources,
             )
-            SetupLine(
-                label = "DAT file",
-                value = when {
-                    state.datGameCount > 0 ->
-                        "${state.datName} · ${state.datGameCount} games, ${state.datRomCount} files"
-                    else -> "Not loaded"
-                },
-                buttonText = if (state.hasDat) "Change" else "Load",
-                enabled = !state.phase.isBusy,
-                onClick = onPickDat,
-            )
+
             Button(
                 onClick = onScan,
                 enabled = state.canScan,
@@ -195,16 +210,69 @@ private fun SetupCard(
     }
 }
 
+/**
+ * The DAT row offers both selection shapes side by side: several individual files, or a
+ * whole folder that is walked for DATs. Either way they merge into one database, so the
+ * user never has to work out which DAT covers which ROM.
+ */
+@Composable
+private fun DatSetupLine(
+    state: MainUiState,
+    onPickFiles: () -> Unit,
+    onPickFolder: () -> Unit,
+    onShowSources: () -> Unit,
+) {
+    val library = state.datLibrary
+    val enabled = !state.phase.isBusy
+
+    Column {
+        SetupLine(
+            label = "DAT database",
+            value = library?.summaryLine ?: "Not loaded",
+            enabled = enabled,
+            onValueClick = if (library != null) onShowSources else null,
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                OutlinedButton(onClick = onPickFiles, enabled = enabled) { Text("Files") }
+                OutlinedButton(onClick = onPickFolder, enabled = enabled) { Text("Folder") }
+            }
+        }
+
+        if (library != null && (library.rejectedCount > 0 || library.truncated)) {
+            Text(
+                text = if (library.truncated) {
+                    "Size limit reached — tap for details"
+                } else {
+                    "${library.rejectedCount} files skipped — tap for details"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = LocalStatusColors.current.warning,
+                modifier = Modifier.clickable(onClick = onShowSources).padding(top = 2.dp),
+            )
+        }
+    }
+}
+
 @Composable
 private fun SetupLine(
     label: String,
     value: String,
-    buttonText: String,
     enabled: Boolean,
-    onClick: () -> Unit,
+    onValueClick: (() -> Unit)? = null,
+    trailing: @Composable () -> Unit,
 ) {
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Column(modifier = Modifier.weight(1f)) {
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .then(
+                    if (onValueClick != null && enabled) {
+                        Modifier.clickable(onClick = onValueClick)
+                    } else {
+                        Modifier
+                    },
+                ),
+        ) {
             Text(
                 text = label,
                 style = MaterialTheme.typography.labelMedium,
@@ -214,9 +282,10 @@ private fun SetupLine(
                 text = value,
                 style = MaterialTheme.typography.bodyMedium,
                 maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
             )
         }
-        OutlinedButton(onClick = onClick, enabled = enabled) { Text(buttonText) }
+        trailing()
     }
 }
 
@@ -225,8 +294,12 @@ private fun ProgressBanner(phase: Phase) {
     if (phase is Phase.Idle) return
 
     val (text, fraction) = when (phase) {
-        is Phase.LoadingDat ->
-            "Reading ${phase.fileName} — ${phase.gamesParsed} games" to phase.fraction
+        is Phase.LoadingDats ->
+            buildString {
+                if (phase.fileCount > 1) append("DAT ${phase.fileNumber}/${phase.fileCount} · ")
+                append(phase.fileName)
+                if (phase.gamesParsed > 0) append(" — ${phase.gamesParsed} games")
+            } to phase.fraction
 
         is Phase.Listing ->
             buildString {
@@ -329,7 +402,8 @@ private fun EmptyState(state: MainUiState, modifier: Modifier = Modifier) {
     val message = when {
         !state.hasFolder -> "Choose the folder holding your ROMs. ROMRenamer only ever touches " +
             "the folder you grant it."
-        !state.hasDat -> "Load the No-Intro or Redump XML DAT for this system."
+        !state.hasDat -> "Load your No-Intro or Redump DATs — pick individual files, or a " +
+            "folder to merge every DAT inside it into one database."
         state.roms.isEmpty() && state.phase.isBusy -> "Working…"
         state.roms.isEmpty() -> "Run a scan to hash your ROMs and match them against the DAT."
         else -> "Nothing matches the \"${state.rowFilter.label}\" filter."
@@ -479,6 +553,88 @@ private fun ReportDialog(report: RenameReport, onDismiss: () -> Unit) {
             }
         },
         confirmButton = { Button(onClick = onDismiss) { Text("Done") } },
+    )
+}
+
+/**
+ * Per-file breakdown of the merged database.
+ *
+ * A folder selection routinely contains files that are not DATs, so the app needs to be
+ * able to say exactly which ones contributed and which were passed over — otherwise a
+ * silently-ignored DAT looks identical to a ROM that genuinely is not catalogued.
+ */
+@Composable
+private fun DatSourcesDialog(library: DatLibrary, onDismiss: () -> Unit) {
+    val loaded = library.outcomes.filterIsInstance<DatSourceOutcome.Loaded>()
+    val rejected = library.outcomes.filterIsInstance<DatSourceOutcome.Rejected>()
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("DAT database") },
+        text = {
+            Column {
+                Text(library.summaryLine, style = MaterialTheme.typography.bodyMedium)
+                if (library.truncated) {
+                    Text(
+                        text = "The merge stopped at the entry limit, so the last files were " +
+                            "not read. Select fewer DATs for a complete database.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = LocalStatusColors.current.warning,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
+                }
+
+                LazyColumn(modifier = Modifier.height(280.dp).padding(top = 12.dp)) {
+                    if (loaded.isNotEmpty()) {
+                        item {
+                            SectionLabel("Loaded (${loaded.size})")
+                        }
+                        items(items = loaded, key = { it.source.uri.toString() }) { outcome ->
+                            Column(modifier = Modifier.padding(vertical = 3.dp)) {
+                                Text(
+                                    outcome.header.displayName,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                Text(
+                                    "${outcome.source.displayPath} · ${outcome.games} games",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                    if (rejected.isNotEmpty()) {
+                        item {
+                            SectionLabel("Skipped (${rejected.size})")
+                        }
+                        items(items = rejected, key = { it.source.uri.toString() }) { outcome ->
+                            Column(modifier = Modifier.padding(vertical = 3.dp)) {
+                                Text(
+                                    outcome.source.displayPath,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                Text(
+                                    outcome.reason,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
+}
+
+@Composable
+private fun SectionLabel(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(top = 8.dp, bottom = 2.dp),
     )
 }
 
